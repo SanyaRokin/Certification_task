@@ -1,0 +1,173 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: False
+  become: yes
+
+  tasks:
+    - name: Gather information about the tag "BuildInstance"
+      community.aws.ec2_instance_info:
+        filters:
+          "tag:Name": BuildInstance
+          instance-state-name: [ "running"]
+        region: us-east-2
+      register: BuildInstance_result
+
+    - name: Gather information about the tag "ProdInstance"
+      community.aws.ec2_instance_info:
+        filters:
+          "tag:Name": ProdInstance
+          instance-state-name: [ "running"]
+        region: us-east-2
+      register: ProdInstance_result
+
+    - name: Wait for SSH to come up
+      wait_for:
+        host: "{{ item.public_dns_name }}"
+        port: 22
+        delay: 5
+        timeout: 10
+        state: started
+      with_items: "{{ BuildInstance_result.instances }}"
+
+    - name: Wait for SSH to come up
+      wait_for:
+        host: "{{ item.public_dns_name }}"
+        port: 22
+        delay: 5
+        timeout: 10
+        state: started
+      with_items: "{{ ProdInstance_result.instances }}"
+
+    - name: Add public IP of build
+      add_host:
+        hostname: "{{ item.public_dns_name }}"
+        groupname: awsBuild
+      loop: "{{ BuildInstance_result.instances }}"
+
+    - name: Add EC2 Build as known hosts
+      known_hosts:
+        name: "{{ item.public_dns_name }}"
+        key: "{{ lookup('pipe', 'ssh-keyscan -t rsa ' + item.public_dns_name) }}"
+      with_items: "{{ BuildInstance_result.instances }}"
+
+    - name: Add public IP of prod
+      add_host:
+        hostname: "{{ item.public_dns_name }}"
+        groupname: awsProd
+      loop: "{{ ProdInstance_result.instances }}"
+
+    - name: Add EC2 Build as known hosts
+      known_hosts:
+        name: "{{ item.public_dns_name }}"
+        key: "{{ lookup('pipe', 'ssh-keyscan -t rsa ' + item.public_dns_name) }}"
+      with_items: "{{ ProdInstance_result.instances }}"
+
+-  name: Configure EC2 instance
+   hosts: awsBuild
+   remote_user: ubuntu
+   become: yes
+   become_user: root
+   gather_facts: False
+
+   tasks:
+     - name: Update repo cache
+       apt:
+         update_cache: yes
+
+     - name: Esure git and maven package is present
+       apt:
+         update_cache: yes
+         name:
+           - git
+           - maven
+           - default-jdk
+           - docker.io
+           - python3-pip
+         state: present
+
+     - name: Ensure pip packages is present
+       pip:
+         name:
+           - docker-py
+
+     - name: Ensure git java is present
+       git:
+         repo: https://github.com/boxfuse/boxfuse-sample-java-war-hello.git
+         dest: /tmp/box
+
+     - name: Build java source code with maven
+       command: mvn package -f /tmp/box
+
+     - name: copy Dockerfile
+       copy:
+         src: ./Dockerfile
+         dest: /tmp/box/
+         owner: root
+         group: root
+         mode: '0644'
+
+     - name: build container image
+       docker_image:
+         name: prodimage:1.0
+         build:
+           path: /tmp/box/
+         source: build
+         state: present
+
+     - name: archive container image as a tarball
+       docker_image:
+         name: prodimage:1.0
+         archive_path: /tmp/prodimage:1.0.tar
+         source: pull
+         state: present
+
+     - name: Copy tarball to host
+       synchronize:  src={{ item }} dest=./ mode=pull
+       with_items:
+         - "/tmp/prodimage:1.0.tar"
+
+- name: Configure EC2 instance
+  hosts: awsProd
+  remote_user: ubuntu
+  become: yes
+  become_user: root
+  gather_facts: False
+
+  tasks:
+    - name: Update repo cache
+      apt:
+        update_cache: yes
+
+    - name: Esure git and maven package is present
+      apt:
+        update_cache: yes
+        name:
+          - docker.io
+          - python3-pip
+        state: present
+
+    - name: Ensure pip packages is present
+      pip:
+        name:
+          - docker-py
+
+    - name: copy tarball to Prod
+      copy:
+        src: ./prodimage:1.0.tar
+        dest: /tmp/prodimage:1.0.tar
+
+    - name: Load container from tarball
+      docker_image:
+        name: prodimage:1.0.tar
+        load_path: /tmp/prodimage:1.0.tar
+        state: present
+
+    - name: Start prodimage
+      docker_container:
+        name: prodimage
+        image: prodimage:1.0
+        ports:
+          - "8080:8080"
+        state: started
+        restart: yes
